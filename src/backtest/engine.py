@@ -52,10 +52,39 @@ class Backtester:
         drawdown = (equity - peak) / peak
         max_drawdown = drawdown.min()
 
+        def _to_scalar(x):
+            """Convert a pandas/numpy scalar or single-element container to a Python float.
+
+            Handles: pandas Series/Index with one element, numpy scalar/array with one element,
+            and plain Python numeric types.
+            """
+            # pandas Series with a single value
+            try:
+                import numpy as _np
+                import pandas as _pd
+            except Exception:
+                _np = None
+                _pd = None
+
+            if _pd is not None and isinstance(x, _pd.Series):
+                if x.size == 0:
+                    return float("nan")
+                return float(x.iloc[0])
+            # numpy array or scalar
+            if _np is not None:
+                if isinstance(x, _np.ndarray):
+                    if x.size == 0:
+                        return float("nan")
+                    return float(x.ravel()[0])
+                if _np.isscalar(x):
+                    return float(x)
+            # fallback for plain python numeric
+            return float(x)
+
         return BacktestResult(
             equity=equity,
             returns=strat_ret,
-            cumulative_return=float(cumulative_return),
-            annualized_return=float(annualized_return),
-            max_drawdown=float(max_drawdown),
+            cumulative_return=_to_scalar(cumulative_return),
+            annualized_return=_to_scalar(annualized_return),
+            max_drawdown=_to_scalar(max_drawdown),
         )
