@@ -18,3 +18,17 @@ def test_moving_average_cross_signals():
     # signals should be 0/1 and align with the index
     assert set(signals.unique()).issubset({0, 1})
 
+
+def test_momentum_strategy_signals():
+    dates = pd.date_range("2021-01-01", periods=6, freq="D")
+    # create a small rising series so momentum is positive
+    prices = pd.Series([10, 11, 12, 13, 14, 15], index=dates)
+
+    from src.backtest.strategy import MomentumStrategy
+
+    strat = MomentumStrategy(lookback=2, threshold=0.01)
+    signals = strat.generate_signals(prices)
+
+    assert isinstance(signals, pd.Series)
+    assert set(signals.unique()).issubset({0, 1})
+

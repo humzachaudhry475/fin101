@@ -15,9 +15,10 @@ if str(ROOT) not in sys.path:
 from datetime import datetime
 from pathlib import Path
 import matplotlib.pyplot as plt
+import argparse
 
 from src.backtest.data import download_sp500
-from src.backtest.strategy import MovingAverageCrossStrategy
+from src.backtest.strategy import MovingAverageCrossStrategy, MomentumStrategy
 from src.backtest.engine import Backtester
 import pandas as pd
 
@@ -31,6 +32,7 @@ def run_example(
 	save_plots: bool = False,
 	save_dir: str | Path | None = None,
 	interactive: bool = True,
+	strategy: str = "ma",  # 'ma' or 'momentum'
 ):
 	"""Run example and plot results.
 
@@ -60,9 +62,157 @@ def run_example(
 			raise RuntimeError("Downloaded data contains no numeric columns")
 		close = df[numeric_cols[0]]
 
-	# short strategy example
-	strat = MovingAverageCrossStrategy(short_window=50, long_window=200)
-	signals = strat.generate_signals(close)
+
+	# Prepare save directory early so comparison branch can write files
+	# Ensure save_path is always defined before any strategy branches
+	save_path = None
+	if save_plots:
+		save_path = Path(save_dir or Path(__file__).resolve().parents[2] / "reports_output")
+		save_path.mkdir(parents=True, exist_ok=True)
+
+	# choose strategy
+	if strategy.lower() in ("ma", "moving_average", "moving_average_cross"):
+		strat = MovingAverageCrossStrategy(short_window=50, long_window=200)
+		signals = strat.generate_signals(close)
+		bt = Backtester(close)
+		res = bt.run(signals)
+	elif strategy.lower() in ("momentum", "mom"):
+		strat = MomentumStrategy(lookback=5, threshold=0.0)
+		signals = strat.generate_signals(close)
+		bt = Backtester(close)
+		res = bt.run(signals)
+	elif strategy.lower() in ("compare", "both"):
+		# run both strategies and plot equity curves together
+		strat_ma = MovingAverageCrossStrategy(short_window=50, long_window=200)
+		strat_mom = MomentumStrategy(lookback=5, threshold=0.0)
+		signals_ma = strat_ma.generate_signals(close)
+		signals_mom = strat_mom.generate_signals(close)
+		bt = Backtester(close)
+		res_ma = bt.run(signals_ma)
+		res_mom = bt.run(signals_mom)
+
+		print("--- Moving Average Strategy ---")
+		print(f"Cumulative return: {res_ma.cumulative_return:.2%}")
+		print(f"Annualized return (approx): {res_ma.annualized_return:.2%}")
+		print(f"Max drawdown: {res_ma.max_drawdown:.2%}")
+		print("--- Momentum Strategy ---")
+		print(f"Cumulative return: {res_mom.cumulative_return:.2%}")
+		print(f"Annualized return (approx): {res_mom.annualized_return:.2%}")
+		print(f"Max drawdown: {res_mom.max_drawdown:.2%}")
+
+		# plot comparison equity curves
+		plt.figure(figsize=(10, 5))
+		res_ma.equity.plot(label="MA Equity")
+		res_mom.equity.plot(label="Momentum Equity")
+		plt.title("Strategy equity comparison")
+		plt.xlabel("Date")
+		plt.ylabel("Equity (growth of 1.0)")
+		plt.legend()
+		plt.grid(True)
+		if save_path:
+			png = save_path / f"equity_compare_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+			pdf = save_path / f"equity_compare_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+			plt.savefig(png, bbox_inches="tight")
+			plt.savefig(pdf, bbox_inches="tight")
+			print(f"Saved comparison equity plots to: {png} and {pdf}")
+		plt.show()
+
+		# optionally save trade logs for each strategy
+		def _build_and_save_trades(signals, name_suffix):
+			pos2 = signals.reindex(close.index).fillna(0).astype(int).squeeze()
+			tr2 = pos2.diff().fillna(0)
+			buys2 = tr2[tr2 == 1].index
+			sells2 = tr2[tr2 == -1].index
+			rows2 = []
+			for t in buys2:
+				# robustly extract a single price value (DataFrame/Series -> scalar)
+				if 'Open' in df.columns:
+					val = df['Open'].reindex([t]).squeeze()
+					try:
+						price_val = float(val)
+					except Exception:
+						# fallback to iloc for single-element series
+						price_val = float(val.iloc[0]) if hasattr(val, 'iloc') else float(val)
+				else:
+					val = close.reindex([t]).squeeze()
+					price_val = float(val)
+				rows2.append({"timestamp": t, "side": "buy", "price": price_val, "size": 1.0})
+			for t in sells2:
+				# robustly extract a single price value (DataFrame/Series -> scalar)
+				if 'Open' in df.columns:
+					val = df['Open'].reindex([t]).squeeze()
+					try:
+						price_val = float(val)
+					except Exception:
+						price_val = float(val.iloc[0]) if hasattr(val, 'iloc') else float(val)
+				else:
+					val = close.reindex([t]).squeeze()
+					price_val = float(val)
+				rows2.append({"timestamp": t, "side": "sell", "price": price_val, "size": 1.0})
+			df_tr = pd.DataFrame(rows2).sort_values("timestamp")
+			if save_path and not df_tr.empty:
+				pth = save_path / f"detected_trades_{name_suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+				df_tr.to_csv(pth, index=False)
+				print(f"Saved trades for {name_suffix} to: {pth}")
+
+		_build_and_save_trades(signals_ma, "ma")
+		_build_and_save_trades(signals_mom, "momentum")
+
+		# Also plot the price series with buy/sell markers for both strategies
+		plt.figure(figsize=(12, 6))
+		plt.plot(close.index, close.to_numpy(), label="S&P 500 Close", color="#1f77b4")
+
+		# helper to get price Series for an index (prefer 'Open' if available)
+		def _price_series_for(idx):
+			if len(idx) == 0:
+				return pd.Series(dtype=float, index=idx)
+			if "Open" in df.columns:
+				return df["Open"].reindex(idx)
+			return close.reindex(idx)
+
+		# MA markers
+		pos_ma = signals_ma.reindex(close.index).fillna(0).astype(int).squeeze()
+		tr_ma = pos_ma.diff().fillna(0)
+		buys_ma = tr_ma[tr_ma == 1].index
+		sells_ma = tr_ma[tr_ma == -1].index
+		buy_prices_ma = _price_series_for(buys_ma)
+		sell_prices_ma = _price_series_for(sells_ma)
+
+		# Momentum markers
+		pos_mom = signals_mom.reindex(close.index).fillna(0).astype(int).squeeze()
+		tr_mom = pos_mom.diff().fillna(0)
+		buys_mom = tr_mom[tr_mom == 1].index
+		sells_mom = tr_mom[tr_mom == -1].index
+		buy_prices_mom = _price_series_for(buys_mom)
+		sell_prices_mom = _price_series_for(sells_mom)
+
+		# plot markers (use distinct shapes/colors)
+		if len(buys_ma) > 0:
+			plt.scatter(buys_ma, buy_prices_ma.to_numpy(), marker="^", color="green", s=80, label="MA Buy")
+		if len(sells_ma) > 0:
+			plt.scatter(sells_ma, sell_prices_ma.to_numpy(), marker="v", color="darkgreen", s=80, label="MA Sell")
+		if len(buys_mom) > 0:
+			plt.scatter(buys_mom, buy_prices_mom.to_numpy(), marker="s", color="orange", s=60, label="Momentum Buy")
+		if len(sells_mom) > 0:
+			plt.scatter(sells_mom, sell_prices_mom.to_numpy(), marker="x", color="red", s=60, label="Momentum Sell")
+
+		plt.title("S&P 500 Price with Strategy Buys/Sells (MA vs Momentum)")
+		plt.xlabel("Date")
+		plt.ylabel("Price")
+		plt.legend()
+		plt.grid(True)
+		if save_path:
+			png = save_path / f"price_trades_compare_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+			pdf = save_path / f"price_trades_compare_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+			plt.savefig(png, bbox_inches="tight")
+			plt.savefig(pdf, bbox_inches="tight")
+			print(f"Saved comparison price/trade plots to: {png} and {pdf}")
+		plt.show()
+
+		# comparison done — return early (skip single-strategy plotting below)
+		return
+	else:
+		raise ValueError("Unknown strategy. Use 'ma', 'momentum' or 'compare'.")
 
 	bt = Backtester(close)
 	res = bt.run(signals)
@@ -71,11 +221,7 @@ def run_example(
 	print(f"Annualized return (approx): {res.annualized_return:.2%}")
 	print(f"Max drawdown: {res.max_drawdown:.2%}")
 
-	# Prepare save directory
-	save_path = None
-	if save_plots:
-		save_path = Path(save_dir or Path(__file__).resolve().parents[2] / "reports_output")
-		save_path.mkdir(parents=True, exist_ok=True)
+
 
 	# detect plotly availability early so we can fallback gracefully
 	plotly_available = False
@@ -266,4 +412,12 @@ def run_example(
 
 
 if __name__ == "__main__":
-	run_example()
+	parser = argparse.ArgumentParser(description="Run example strategies and plot results.")
+	parser.add_argument("--start", type=str, default="2010-01-01", help="Start date")
+	parser.add_argument("--end", type=str, default=None, help="End date")
+	parser.add_argument("--strategy", type=str, default="ma", help="Strategy: ma, momentum, or compare")
+	parser.add_argument("--no-interactive", dest="interactive", action="store_false", help="Disable interactive (Plotly) plots")
+	parser.add_argument("--save-plots", dest="save_plots", action="store_true", help="Save plots and trade CSVs to reports_output")
+	args = parser.parse_args()
+
+	run_example(start=args.start, end=args.end, interactive=args.interactive, save_plots=args.save_plots, strategy=args.strategy)
